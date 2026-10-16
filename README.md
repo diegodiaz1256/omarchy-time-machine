@@ -125,11 +125,19 @@ You only need `name` and `repository`. Everything else already has a sensible de
 | `exclude_file` | `excludes.txt` next to your config | Things to skip. Caches, downloads, virtual machine images. Anything you can get back another way. |
 | `retention` | 7 daily, 4 weekly, 12 monthly, 3 yearly | How far back you can go. Older backups get thinned out rather than kept forever. |
 | `schedule` | none | When it runs. `"*-*-* 03:00:00"` is every night at three. Leave it out and this destination only runs when you press the button. |
+| `limit_upload_kib` | 0 (no limit) | Cap on upload speed in KiB/s, so a backup does not saturate your connection. `2048` is about 16 Mbit/s. |
+| `limit_download_kib` | 0 (no limit) | Same for downloads (prune reads back from the repository). |
+| `read_concurrency` | 1 | How many files restic reads at once. Low keeps the disk free for you. |
+| `cpu_threads` | all cores | Caps how many cores restic may use (sets `GOMAXPROCS`). |
+| `boot_delay_minutes` | 10 | A scheduled run that catches up after boot waits until the machine has been up this long. The Back Up Now button never waits. `0` disables it. |
+| `prune_every_days` | 7 | Old snapshots are forgotten after every backup, as per `retention`, but the heavy prune step that frees disk space runs only this often. `0` prunes every time. |
 | `display_name` | the `name` | What the panel calls it. "The drive in my bag" reads better than `usb2`. |
 | `pre_command` | none | A command to wake the destination first. See below. |
 | `on_failure_command` | none | A command to run when a backup fails, if a red icon isn't enough. |
 
-Run `omarchy-time-machine install` again after changing a schedule.
+The tuning settings (`limit_*`, `read_concurrency`, `cpu_threads`, `boot_delay_minutes`, `prune_every_days`) can also sit at the top level of the file to apply to every destination; a destination's own value wins. The backup service runs with idle CPU scheduling, `Nice=19`, `CPUWeight=10` and idle IO priority.
+
+Run `omarchy-time-machine install` again after changing a schedule or updating the plugin, so the service unit picks up its new priorities.
 
 Run it once after updating past 1.1.0 as well, even if nothing changed. Timers written before that carried a `Requires=` on the backup service, which meant that stopping a running backup switched the timer off with it: the run you cancelled was the last one that was ever scheduled, and nothing said so. The units are rewritten and re-enabled by that command; until you run it, an already-stopped timer stays stopped.
 

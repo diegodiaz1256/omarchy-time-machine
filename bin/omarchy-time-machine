@@ -377,6 +377,52 @@ keep_value() {
   number_or "$value" "$fallback"
 }
 
+# Tuning knobs (limit_upload_kib, read_concurrency, ...): the destination wins
+# over the top level, which wins over the default. Always a non-negative number.
+tune_value() {
+  local key="$1" fallback="$2" value
+  value="$(jq -r --arg k "$key" '.[$k] // empty' <<<"$DEST_JSON" 2>/dev/null)"
+  [ -n "$value" ] || value="$(jq -r --arg k "$key" '.[$k] // empty' <<<"$CONFIG_JSON" 2>/dev/null)"
+  number_or "$value" "$fallback"
+}
+
+# A backup started by the timer right after boot competes with everything the
+# login is loading, on a page cache that is still cold. Hold it back until the
+# machine has been up for boot_delay_minutes. Only runs the timer fired are held
+# back (its last trigger is seconds old); the Back Up Now button starts the same
+# service, and a run from a terminal has no INVOCATION_ID at all.
+wait_for_boot_settle() {
+  local minutes up wait fired fired_epoch
+  [ -n "${INVOCATION_ID:-}" ] || return 0
+  fired="$(systemctl --user show "omarchy-time-machine@$DEST_NAME.timer" -p LastTriggerUSec --value 2>/dev/null)"
+  fired_epoch="$(date -d "$fired" +%s 2>/dev/null)" || return 0
+  [ $(( $(date +%s) - fired_epoch )) -le 120 ] || return 0
+  minutes="$(tune_value boot_delay_minutes 10)"
+  [ "$minutes" -gt 0 ] || return 0
+  up="$(cut -d. -f1 /proc/uptime 2>/dev/null)"
+  up="$(number_or "$up" 0)"
+  wait=$((minutes * 60 - up))
+  [ "$wait" -gt 0 ] || return 0
+  log_line "Machine booted ${up}s ago, waiting ${wait}s so the login can settle"
+  sleep "$wait"
+}
+
+PRUNE_STAMP=""
+
+# Pruning rewrites packs and reads a lot of the repository, so it runs once
+# every prune_every_days (default 7) instead of after every backup. The forget
+# half, which applies the same retention policy, still runs every time.
+prune_due() {
+  local days now last
+  days="$(tune_value prune_every_days 7)"
+  [ "$days" -gt 0 ] || return 0
+  PRUNE_STAMP="$STATE_DIR/last-prune-$DEST_NAME"
+  now="$(date +%s)"
+  last=0
+  [ -f "$PRUNE_STAMP" ] && last="$(number_or "$(cat -- "$PRUNE_STAMP" 2>/dev/null)" 0)"
+  [ $((now - last)) -ge $((days * 86400 - 3600)) ]
+}
+
 # ---------------------------------------------------------------------------
 # Secrets
 # ---------------------------------------------------------------------------
@@ -1095,6 +1141,7 @@ cmd_backup() {
   config_dir_secure
   private_dir "$STATE_DIR" logs
   open_log
+  wait_for_boot_settle
   progress_init backup "omarchy-time-machine@$DEST_NAME.service"
 
   local started started_epoch backup_args exclude_file pattern entry
@@ -1156,6 +1203,18 @@ cmd_backup() {
   clear_stale_locks
 
   backup_args=(backup --json --exclude-caches --retry-lock 10m)
+
+  # Gentle by default. 0 means no limit for the two bandwidth caps. The caps
+  # go in RESTIC_ARGS so the forget/prune step below honours them too.
+  local limit_up limit_down threads
+  limit_up="$(tune_value limit_upload_kib 0)"
+  limit_down="$(tune_value limit_download_kib 0)"
+  [ "$limit_up" -gt 0 ] && RESTIC_ARGS+=(--limit-upload "$limit_up")
+  [ "$limit_down" -gt 0 ] && RESTIC_ARGS+=(--limit-download "$limit_down")
+  backup_args+=(--read-concurrency "$(tune_value read_concurrency 1)")
+  # restic is a Go program and spreads over every core unless told otherwise.
+  threads="$(tune_value cpu_threads 0)"
+  [ "$threads" -gt 0 ] && export GOMAXPROCS="$threads"
 
   # An explicitly configured exclude file that is missing is an error: you
   # asked for it, and silently backing up everything you meant to skip is worse
@@ -1326,16 +1385,23 @@ unreadable_reason() {
 }
 
 run_forget() {
+  local -a prune_args=()
   log_line ""
-  log_line "Removing old snapshots..."
+  if prune_due; then
+    prune_args=(--prune)
+    log_line "Removing old snapshots and pruning..."
+  else
+    log_line "Removing old snapshots (prune is due less often, see prune_every_days)..."
+  fi
   restic_run forget \
     --keep-daily "$(keep_value daily 7)" \
     --keep-weekly "$(keep_value weekly 4)" \
     --keep-monthly "$(keep_value monthly 12)" \
     --keep-yearly "$(keep_value yearly 3)" \
     --retry-lock 10m \
-    --prune >>"$LOG_FILE" 2>&1 ||
+    "${prune_args[@]}" >>"$LOG_FILE" 2>&1 ||
     log_line "forget/prune reported a problem, see the log"
+  [ "${#prune_args[@]}" -gt 0 ] && [ -n "$PRUNE_STAMP" ] && date +%s >"$PRUNE_STAMP" 2>/dev/null
   return 0
 }
 
@@ -1707,9 +1773,17 @@ ExecStart=$SELF backup --dest %i
 # not cut off halfway.
 TimeoutStartSec=8h
 
-# A backup must not make the machine unusable while you work on it.
-Nice=10
+# A backup must not make the machine unusable while you work on it. Idle CPU
+# scheduling only runs it when nothing else wants the CPU. CPUWeight is the
+# cgroup half of the same promise. IOWeight only takes effect where the io
+# controller is delegated to user units, and IOSchedulingClass=idle only on a
+# scheduler that honours it (bfq); elsewhere both are harmless.
+Nice=19
+CPUSchedulingPolicy=idle
+CPUWeight=10
 IOSchedulingClass=idle
+IOSchedulingPriority=7
+IOWeight=10
 UNIT
 }
 
